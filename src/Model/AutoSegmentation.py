@@ -2,14 +2,9 @@ import os
 import shutil
 import tempfile
 import logging
-
 from src.Model.PatientDictContainer import PatientDictContainer
 from src.Model.Worker import SegmentationWorkerSignals
 import fnmatch
-
-# TODO: Move this to own module?
-# from ignore_files_in_dir import ignore_func
-
 from totalsegmentator.python_api import totalsegmentator
 from src.Model.NiftiToRtstructConverter import nifti_to_rtstruct_conversion
 from src.View.util.RedirectStdOut import ConsoleOutputStream, redirect_output_to_gui, setup_logging
@@ -39,20 +34,7 @@ class AutoSegmentation:
         self.signals.finished.connect(self.controller.on_segmentation_finished)
         self.signals.error.connect(self.controller.on_segmentation_error)
 
-    def _create_copied_temporary_directory(self, dicom_dir):
-        self.dicom_temp_dir = tempfile.TemporaryDirectory()
-
-        if not dicom_dir:
-            error_message = f'No dicom directory found. Received dicom_dir={dicom_dir!r}'
-            raise ValueError(error_message)
-
-        try:
-            shutil.copytree(dicom_dir, self.dicom_temp_dir.name, ignore=_exclude_files_from_copy, dirs_exist_ok=True)
-        except Exception as e:
-            copy_error_message = f"Failed to copy DICOM files: {e}"
-            raise ValueError(copy_error_message) from e
-
-    def _connect_terminal_stream_to_gui(self):
+    def _connect_terminal_stream_to_gui(self) -> None:
         """
         Connects the terminal stream to the GUI window to
         update the progress text
@@ -64,80 +46,135 @@ class AutoSegmentation:
 
     def run_segmentation_workflow(self, task, fast):
         """
-        Executes the segmentation workflow.
+        Runs the full segmentation workflow for a given task and speed setting.
+        This method manages the process of segmenting DICOM images, converting the
+        results to RTSTRUCT, and cleaning up temporary files.
 
-        This method handles the entire segmentation process, from selecting the DICOM
-        directory to running the segmentation task and converting the output to DICOM RTSTRUCT.
+        Args:
+            task: The segmentation task to perform.
+            fast: Whether to use the fastest segmentation mode.
+
+        Returns:
+            None
         """
-        # Update text GUI for visual user feedback
         self.signals.progress_updated.emit("Starting segmentation workflow...")
-
-        # Connect the terminal stream output to the progress text gui element
         self._connect_terminal_stream_to_gui()
-
-        # Create the output path for Nifti segmentation files
-        output_dir = os.path.join(self.dicom_dir, "segmentations")
-        os.makedirs(output_dir, exist_ok=True)
-        output_rt = os.path.join(self.dicom_dir, "rtss.dcm")
+        output_dir, output_rt = self._prepare_output_paths()
 
         try:
-            # Copy contents from selected dir to temp dir (excludes rt*.dcm files)
-            self._create_copied_temporary_directory(self.dicom_dir)
-
-            # Call total segmentator API
-            totalsegmentator(input=self.dicom_temp_dir.name,
-                             output=output_dir,
-                             task=task,
-                             output_type="nifti",
-                             device="cpu",
-                             fastest=fast
-                             )
-
-            nifti_to_rtstruct_conversion(output_dir, self.dicom_temp_dir.name, output_rt)
-            self.signals.progress_updated.emit("Conversion to RTSTRUCT complete.")
-            try:
-                if os.path.exists(output_dir):
-                    shutil.rmtree(output_dir)
-                    self.signals.progress_updated.emit("Nifti files removed.")
-                else:
-                    self.signals.progress_updated.emit("Nifti files not found for removal.")
-            except Exception as remove_err:
-                self.signals.progress_updated.emit(f"Failed to remove Nifti files: {remove_err}")
+            self._copy_temp_dicom_dir()
+            self._run_totalsegmentation(task, fast, output_dir)
+            self._convert_to_rtstruct(output_dir, output_rt)
+            self._cleanup_nifti_dir(output_dir)
             self.signals.finished.emit()
-
         except Exception as e:
-            self.signals.error.emit(str(e))  # Emit the error message
-            logger.exception(f"Segmentation workflow failed: {e}") # Log the full exception
-
+            self.signals.error.emit(str(e))
+            logger.exception("Segmentation workflow failed")
         finally:
-            if self.dicom_temp_dir is not None:
-                self.dicom_temp_dir.cleanup()
+            self._cleanup_temp_dir()
 
+    def _prepare_output_paths(self) -> tuple[str, str]:
+        """
+        Prepares and returns the output paths for segmentation and RTSTRUCT files.
+        This method creates the output directory for segmentation results if it does
+        not exist and determines the path for the RTSTRUCT file.
 
-# This function is specific to loading the dcm image files for Total Segmnetator API
-def _exclude_files_from_copy(directory, contents):
-    """Filters files and directories to be excluded when copying.
+        Returns:
+            tuple: A tuple containing the output directory path and the RTSTRUCT file path.
+        """
+        out_dir = os.path.join(self.dicom_dir, "segmentations")
+        os.makedirs(out_dir, exist_ok=True)
+        out_rt = os.path.join(self.dicom_dir, "rtss.dcm")
 
-    This function is used with `shutil.copytree` to ignore specific files
-    or directories during the copy operation.  It currently excludes files
-    matching the pattern "rt*.dcm".
+        return out_dir, out_rt
 
-    Args:
-        directory: The directory being scanned.
-        contents: A list of files and directories within the directory.
+    def _copy_temp_dicom_dir(self) -> None:
+        """
+        Copies the DICOM directory to a temporary location for processing.
+        This method creates a temporary directory and copies the DICOM files
+        into it, excluding RTSTRUCT files.
 
-    Returns:
-        A list of files and directories to be ignored.
-    """
-    exclude_patterns = ["rt*.dcm"]
+        Raises:
+            ValueError: If the DICOM directory is not set or copying fails.
+        """
+        if not self.dicom_dir:
+            raise ValueError(f"No dicom directory found: {self.dicom_dir!r}")
+        self.dicom_temp_dir = tempfile.TemporaryDirectory()
+        try:
+            shutil.copytree(
+                self.dicom_dir,
+                self.dicom_temp_dir.name,
+                ignore=shutil.ignore_patterns("rt*.dcm"),
+                dirs_exist_ok=True,
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to copy DICOM files: {e}") from e
 
-    filtered_files = []
-    filtered_files.extend(
-        file
-        for file in contents
-        if any(
-            fnmatch.fnmatch(file.lower(), pattern)
-            for pattern in exclude_patterns
+    def _run_totalsegmentation(self, task, fast, output_dir) -> None:
+        """
+        Runs the TotalSegmentator segmentation task and saves the results.
+        This method executes the segmentation process using the specified task and
+        speed, and stores the output in the given directory.
+
+        Args:
+            task: The segmentation task to perform.
+            fast: Whether to use the fastest segmentation mode.
+            output_dir: Directory to store the segmentation results.
+
+        Returns:
+            None
+        """
+        totalsegmentator(
+            input=self.dicom_temp_dir.name,
+            output=output_dir,
+            task=task,
+            output_type="nifti",
+            device="cpu",
+            fastest=fast,
         )
-    )
-    return filtered_files
+
+    def _convert_to_rtstruct(self, nifti_dir, output_rt) -> None:
+        """
+        Converts NIfTI segmentation results to a DICOM RTSTRUCT file.
+        This method calls the conversion utility and updates the progress signal.
+
+        Args:
+            nifti_dir: Directory containing the NIfTI segmentation files.
+            output_rt: Path to save the generated RTSTRUCT file.
+
+        Returns:
+            None
+        """
+        nifti_to_rtstruct_conversion(nifti_dir, self.dicom_temp_dir.name, output_rt)
+        self.signals.progress_updated.emit("Conversion to RTSTRUCT complete.")
+
+    def _cleanup_nifti_dir(self, output_dir) -> None:
+        """
+        Removes the NIfTI segmentation output directory after processing is complete.
+        This method attempts to delete the directory and emits progress updates to the GUI.
+
+        Args:
+            output_dir: The directory containing the NIfTI segmentation files to remove.
+
+        Returns:
+            None
+        """
+        try:
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
+                self.signals.progress_updated.emit("Nifti files removed.")
+            else:
+                self.signals.progress_updated.emit("Nifti files not found for removal.")
+        except Exception as err:
+            self.signals.progress_updated.emit(f"Failed to remove Nifti files: {err}")
+
+    def _cleanup_temp_dir(self) -> None:
+        """
+        Cleans up the temporary DICOM directory if it exists.
+        This method ensures that any temporary directory created for DICOM files is properly removed after processing.
+
+        Returns:
+            None
+        """
+        if self.dicom_temp_dir:
+            self.dicom_temp_dir.cleanup()
