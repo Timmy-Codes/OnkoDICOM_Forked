@@ -11,7 +11,6 @@ from src.Model.PatientDictContainer import PatientDictContainer
 from src.Model.SUV2ROI import SUV2ROI
 from src.View.ImageFusion.ROITransferOptionView import ROITransferOptionView
 from src.View.StyleSheetReader import StyleSheetReader
-from src.View.mainpage.AutoSegmentationTab import AutoSegmentationTab
 from src.View.mainpage.DVHTab import DVHTab
 from src.View.mainpage.DicomTreeView import DicomTreeView
 from src.View.mainpage.DicomAxialView import DicomAxialView
@@ -143,17 +142,6 @@ class UIMainWindow:
             self.left_panel.addTab(self.isodoses_tab, "Isodoses")
         elif hasattr(self, 'isodoses_tab'):
             del self.isodoses_tab
-
-        # Add Auto-Segmentation to the left panel
-        if not hasattr(self, 'auto_segmentation_tab'):
-            self.auto_segmentation_tab = AutoSegmentationTab(self.stylesheet)
-            # Obtain controller from auto segment tab
-            self._controller = self.auto_segmentation_tab.get_autoseg_controller()
-
-            # Connect update structures signal to main slot
-            self._controller.update_structure_list.connect(self.structures_tab.update_ui)
-
-        self.left_panel.addTab(self.auto_segmentation_tab, "Auto-Seg")
 
         # Right panel contains the different tabs of DICOM view, DVH,
         # clinical data, DICOM tree
@@ -313,6 +301,15 @@ class UIMainWindow:
                 self.image_fusion_view_axial.update_view()
                 self.image_fusion_view_coronal.update_view()
                 self.image_fusion_view_sagittal.update_view()
+                # --- Ensure interrogation mask is reapplied after zoom/windowing ---
+                for view in [
+                    self.image_fusion_single_view,
+                    self.image_fusion_view_axial,
+                    self.image_fusion_view_coronal,
+                    self.image_fusion_view_sagittal,
+                ]:
+                    if hasattr(view, "get_mouse_mode") and view.get_mouse_mode() == "interrogation":
+                        view.refresh_overlay_now()
 
         if hasattr(self, 'draw_roi'):
             if self.draw_roi is not None:
@@ -443,6 +440,7 @@ class UIMainWindow:
         # Define a callback that updates all three views for translation
         def update_all_views(offset):
             for view in [
+                self.image_fusion_single_view,
                 self.image_fusion_view_axial,
                 self.image_fusion_view_sagittal,
                 self.image_fusion_view_coronal,
@@ -457,6 +455,7 @@ class UIMainWindow:
         # Define a callback that updates all three views for rotation
         def update_all_rotations(rotation_tuple):
             for view in [
+                self.image_fusion_single_view,
                 self.image_fusion_view_axial,
                 self.image_fusion_view_sagittal,
                 self.image_fusion_view_coronal,
@@ -470,6 +469,7 @@ class UIMainWindow:
         # --- Connect color pair change to all fusion views ---
         def propagate_color_pair_change(fixed_color, moving_color, coloring_enabled):
             for view in [
+                self.image_fusion_single_view,
                 self.image_fusion_view_axial,
                 self.image_fusion_view_sagittal,
                 self.image_fusion_view_coronal,
@@ -499,7 +499,21 @@ class UIMainWindow:
             self.fusion_options_tab.set_get_vtk_engine_callback(lambda: vtk_engine)
             self.left_panel.addTab(self.fusion_options_tab, "Fusion Options")
             self.left_panel.setCurrentWidget(self.fusion_options_tab)
-    
+
+            # --- Set mouse mode changed callback to update ALL views ---
+            def propagate_mouse_mode_change(mode):
+                for view in [
+                    self.image_fusion_single_view,
+                    self.image_fusion_view_axial,
+                    self.image_fusion_view_sagittal,
+                    self.image_fusion_view_coronal,
+                ]:
+                    if hasattr(view, "_on_mouse_mode_changed"):
+                        view._on_mouse_mode_changed(mode)
+                        # Force overlay refresh so window appears immediately
+                        view.refresh_overlay_now()
+
+            self.fusion_options_tab.set_mouse_mode_changed_callback(propagate_mouse_mode_change)
 
         # VTKEngine integration
         vtk_engine = None
@@ -628,6 +642,7 @@ class UIMainWindow:
         # Update the Add On Option GUI
         self.add_on_options_controller.update_ui()
 
+
     def perform_suv2roi(self):
         """
         Performs the SUV2ROI process.
@@ -708,3 +723,4 @@ class UIMainWindow:
         self.action_handler.action_four_views.setDisabled(disabled)
         self.action_handler.action_show_cut_lines.setDisabled(disabled)
         self.action_handler.action_image_fusion.setDisabled(disabled)
+
