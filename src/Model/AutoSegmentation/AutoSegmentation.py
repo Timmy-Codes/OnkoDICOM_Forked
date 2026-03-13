@@ -1,10 +1,10 @@
 import os
+import copy
 import shutil
 import tempfile
 import logging
 from src.Model.PatientDictContainer import PatientDictContainer
 from src.Model.Worker import SegmentationWorkerSignals
-import fnmatch
 from totalsegmentator.python_api import totalsegmentator
 from src.Model.NiftiToRtstructConverter import nifti_to_rtstruct_conversion
 from src.View.util.RedirectStdOut import ConsoleOutputStream, redirect_output_to_gui, setup_logging
@@ -23,9 +23,10 @@ class AutoSegmentation:
 
     def __init__(self, controller):
         self.controller = controller
-        self.patient_dict_container = PatientDictContainer()
-        self.dicom_dir = self.patient_dict_container.path  # Get the current loaded dir to DICOM series
+        patient_dict_container = PatientDictContainer()
+        self.dicom_dir = patient_dict_container.path  # Get the current loaded dir to DICOM series
         self.dicom_temp_dir = None
+        self.file_paths = patient_dict_container.filepaths # dict, where keys = slice number/RT modality and values = filepaths
 
         self.signals = SegmentationWorkerSignals()
 
@@ -44,7 +45,7 @@ class AutoSegmentation:
         redirect_output_to_gui(output_stream)
         setup_logging(output_stream)
 
-    def run_segmentation_workflow(self, task, fast):
+    def run_segmentation_workflow(self, task, roi_subset):
         """
         Runs the full segmentation workflow for a given task and speed setting.
         This method manages the process of segmenting DICOM images, converting the
@@ -52,7 +53,7 @@ class AutoSegmentation:
 
         Args:
             task: The segmentation task to perform.
-            fast: Whether to use the fastest segmentation mode.
+            roi_subset: The ROI subset to use.
 
         Returns:
             None
@@ -63,14 +64,14 @@ class AutoSegmentation:
 
         try:
             self._copy_temp_dicom_dir()
-            self._run_totalsegmentation(task, fast, output_dir)
+            self._run_totalsegmentation(task, roi_subset, output_dir)
             self._convert_to_rtstruct(output_dir, output_rt)
-            self._cleanup_nifti_dir(output_dir)
             self.signals.finished.emit()
         except Exception as e:
             self.signals.error.emit(str(e))
             logger.exception("Segmentation workflow failed")
         finally:
+            self._cleanup_nifti_dir(output_dir)
             self._cleanup_temp_dir()
 
     def _prepare_output_paths(self) -> tuple[str, str]:
@@ -90,27 +91,33 @@ class AutoSegmentation:
 
     def _copy_temp_dicom_dir(self) -> None:
         """
-        Copies the DICOM directory to a temporary location for processing.
-        This method creates a temporary directory and copies the DICOM files
-        into it, excluding RTSTRUCT files.
+            Copies the file paths from patient dict to a temporary location for processing.
+            This method creates a temporary directory and copies the DICOM files paths
+            into it, excludes rtdose, rtplan, and rtstruct files.
 
-        Raises:
-            ValueError: If the DICOM directory is not set or copying fails.
-        """
-        if not self.dicom_dir:
-            raise ValueError(f"No dicom directory found: {self.dicom_dir!r}")
+            Raises:
+                ValueError: If the DICOM directory is not set or copying fails.
+         """
+        if not self.file_paths:
+            raise ValueError(f"No dicom files found in {self.file_paths}")
+        # Create temporary directory
         self.dicom_temp_dir = tempfile.TemporaryDirectory()
-        try:
-            shutil.copytree(
-                self.dicom_dir,
-                self.dicom_temp_dir.name,
-                ignore=shutil.ignore_patterns("rt*.dcm"),
-                dirs_exist_ok=True,
-            )
-        except Exception as e:
-            raise ValueError(f"Failed to copy DICOM files: {e}") from e
 
-    def _run_totalsegmentation(self, task, fast, output_dir) -> None:
+        # Copy each source file to the temporary directory
+        for name, src_file_path in self.file_paths.items():
+
+            # Exclude files
+            if name in ['rtdose', 'rtss', 'rtplan']:
+                continue
+            # Create new file path
+            dest_file_path = os.path.join(self.dicom_temp_dir.name, os.path.basename(src_file_path))
+            try:
+                shutil.copyfile(src_file_path, dest_file_path)
+            except Exception as e:
+                self.signals.error.emit(str(e))
+
+
+    def _run_totalsegmentation(self, task, roi_subset, output_dir) -> None:
         """
         Runs the TotalSegmentator segmentation task and saves the results.
         This method executes the segmentation process using the specified task and
@@ -118,7 +125,7 @@ class AutoSegmentation:
 
         Args:
             task: The segmentation task to perform.
-            fast: Whether to use the fastest segmentation mode.
+            roi_subset: The ROI subset to use.
             output_dir: Directory to store the segmentation results.
 
         Returns:
@@ -128,9 +135,9 @@ class AutoSegmentation:
             input=self.dicom_temp_dir.name,
             output=output_dir,
             task=task,
+            roi_subset=list(set(copy.deepcopy(roi_subset))), # Deep copy to prevent changing to the selection after starting
             output_type="nifti",
-            device="cpu",
-            fastest=fast,
+            device="gpu"
         )
 
     def _convert_to_rtstruct(self, nifti_dir, output_rt) -> None:
@@ -171,7 +178,8 @@ class AutoSegmentation:
     def _cleanup_temp_dir(self) -> None:
         """
         Cleans up the temporary DICOM directory if it exists.
-        This method ensures that any temporary directory created for DICOM files is properly removed after processing.
+        This method ensures that any temporary directory created
+        for DICOM files is properly removed after processing.
 
         Returns:
             None
